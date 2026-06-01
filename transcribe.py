@@ -31,9 +31,30 @@ def detect_device() -> str:
     return "cpu"
 
 
+def load_audio_tensor(audio_path: str, sample_rate: int = 16000):
+    """Decode audio via the ffmpeg binary to avoid torchcodec shared-library issues."""
+    import subprocess
+    import numpy as np
+    import torch
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-i", audio_path,
+            "-ac", "1", "-ar", str(sample_rate),
+            "-f", "f32le", "-loglevel", "error",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    waveform = torch.from_numpy(
+        np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    ).unsqueeze(0)  # (1, samples)
+    return waveform, sample_rate
+
+
 def diarize(audio_path: str, hf_token: str, device: str):
     import torch
-    import torchaudio
     from pyannote.audio import Pipeline
 
     pipeline = Pipeline.from_pretrained(
@@ -43,8 +64,7 @@ def diarize(audio_path: str, hf_token: str, device: str):
     if device in ("mps", "cuda"):
         pipeline = pipeline.to(torch.device(device))
 
-    # Pre-load audio via torchaudio (uses AVFoundation on macOS, no torchcodec needed)
-    waveform, sample_rate = torchaudio.load(audio_path)
+    waveform, sample_rate = load_audio_tensor(audio_path)
     return pipeline({"waveform": waveform, "sample_rate": sample_rate})
 
 
