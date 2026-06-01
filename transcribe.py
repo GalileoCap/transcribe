@@ -33,6 +33,7 @@ def detect_device() -> str:
 
 def diarize(audio_path: str, hf_token: str, device: str):
     import torch
+    import torchaudio
     from pyannote.audio import Pipeline
 
     pipeline = Pipeline.from_pretrained(
@@ -42,7 +43,9 @@ def diarize(audio_path: str, hf_token: str, device: str):
     if device in ("mps", "cuda"):
         pipeline = pipeline.to(torch.device(device))
 
-    return pipeline(audio_path)
+    # Pre-load audio via torchaudio (uses AVFoundation on macOS, no torchcodec needed)
+    waveform, sample_rate = torchaudio.load(audio_path)
+    return pipeline({"waveform": waveform, "sample_rate": sample_rate})
 
 
 def _whisper_device(device: str) -> tuple[str, str]:
