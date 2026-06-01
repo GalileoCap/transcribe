@@ -44,11 +44,18 @@ def diarize(audio_path: str, hf_token: str, device: str):
     return pipeline(audio_path)
 
 
+def _whisper_device(device: str) -> tuple[str, str]:
+    # CTranslate2 (faster-whisper's backend) only supports cpu and cuda — not mps.
+    ct2_device = "cuda" if device == "cuda" else "cpu"
+    compute_type = "float16" if ct2_device == "cuda" else "int8"
+    return ct2_device, compute_type
+
+
 def transcribe_audio(audio_path: str, model_size: str, device: str, language: str | None):
     from faster_whisper import WhisperModel
 
-    compute_type = "float16" if device in ("cuda", "mps") else "int8"
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    ct2_device, compute_type = _whisper_device(device)
+    model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
     segments, info = model.transcribe(audio_path, beam_size=5, language=language)
     segments = list(segments)
 
@@ -66,8 +73,8 @@ def transcribe_audio_chunked(
     from faster_whisper import WhisperModel
     from faster_whisper.audio import decode_audio
 
-    compute_type = "float16" if device in ("cuda", "mps") else "int8"
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    ct2_device, compute_type = _whisper_device(device)
+    model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
 
     audio = decode_audio(audio_path)
     sample_rate = 16000  # faster-whisper always resamples to 16 kHz
@@ -199,7 +206,8 @@ def main():
         sys.exit(1)
 
     device = args.device or detect_device()
-    print(f"Device: {device}")
+    ct2_device = "cuda" if device == "cuda" else "cpu"
+    print(f"Device: {device} (whisper: {ct2_device}, diarization: {device})")
 
     if args.chunk_languages:
         candidates = args.languages
