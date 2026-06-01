@@ -18,8 +18,26 @@ import sys
 import time
 from pathlib import Path
 
+from typing import NamedTuple
+
 from dotenv import load_dotenv
 load_dotenv()
+
+
+class Segment(NamedTuple):
+    start: float
+    end: float
+    text: str
+
+
+MLX_MODELS = {
+    "tiny":     "mlx-community/whisper-tiny-mlx",
+    "base":     "mlx-community/whisper-base-mlx",
+    "small":    "mlx-community/whisper-small-mlx",
+    "medium":   "mlx-community/whisper-medium-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+}
 
 
 def detect_device() -> str:
@@ -68,63 +86,53 @@ def diarize(audio_path: str, hf_token: str, device: str):
     return pipeline({"waveform": waveform, "sample_rate": sample_rate})
 
 
-def _whisper_device(device: str) -> tuple[str, str]:
-    # CTranslate2 (faster-whisper's backend) only supports cpu and cuda — not mps.
-    ct2_device = "cuda" if device == "cuda" else "cpu"
-    compute_type = "float16" if ct2_device == "cuda" else "int8"
-    return ct2_device, compute_type
+def transcribe_audio(audio_path: str, model_size: str, language: str | None) -> list[Segment]:
+    import mlx_whisper
 
-
-def transcribe_audio(audio_path: str, model_size: str, device: str, language: str | None):
-    from faster_whisper import WhisperModel
-
-    ct2_device, compute_type = _whisper_device(device)
-    model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
-    segments, info = model.transcribe(audio_path, beam_size=5, language=language)
-    segments = list(segments)
-
-    print(f"  Language: {info.language} (confidence {info.language_probability:.0%})")
-    return segments
+    result = mlx_whisper.transcribe(
+        audio_path,
+        path_or_hf_repo=MLX_MODELS[model_size],
+        language=language,
+    )
+    print(f"  Language: {result['language']}")
+    return [Segment(s["start"], s["end"], s["text"]) for s in result["segments"]]
 
 
 def transcribe_audio_chunked(
     audio_path: str,
     model_size: str,
-    device: str,
     candidates: list[str] | None,
     chunk_duration: int = 60,
-):
-    from faster_whisper import WhisperModel
-    from faster_whisper.audio import decode_audio
+) -> list[Segment]:
+    import mlx_whisper
+    from mlx_whisper.audio import load_audio
 
-    ct2_device, compute_type = _whisper_device(device)
-    model = WhisperModel(model_size, device=ct2_device, compute_type=compute_type)
-
-    audio = decode_audio(audio_path)
-    sample_rate = 16000  # faster-whisper always resamples to 16 kHz
-    chunk_samples = chunk_duration * sample_rate
+    repo = MLX_MODELS[model_size]
+    audio = load_audio(audio_path)  # float32 numpy array at 16 kHz
+    chunk_samples = chunk_duration * 16000
     n_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
 
-    all_segments = []
+    all_segments: list[Segment] = []
     prev_lang = (candidates or ["en"])[0]
 
     for i in range(n_chunks):
         chunk = audio[i * chunk_samples : (i + 1) * chunk_samples]
         offset = i * chunk_duration
 
-        lang, prob = model.detect_language(chunk)
+        result = mlx_whisper.transcribe(chunk, path_or_hf_repo=repo, language=None)
+        lang = result["language"]
+
         if candidates and lang not in candidates:
-            lang = prev_lang  # keep previous language rather than jumping to an unexpected one
+            # Detected language is outside the expected set — re-transcribe with the
+            # previous known language rather than accept a likely mis-detection.
+            result = mlx_whisper.transcribe(chunk, path_or_hf_repo=repo, language=prev_lang)
+            lang = prev_lang
+
         prev_lang = lang
+        print(f"  [{format_time(offset)}] Language: {lang}")
 
-        print(f"  [{format_time(offset)}] Language: {lang} ({prob:.0%})")
-
-        segments, _ = model.transcribe(chunk, language=lang, beam_size=5)
-        for seg in segments:
-            all_segments.append(seg._replace(
-                start=seg.start + offset,
-                end=seg.end + offset,
-            ))
+        for s in result["segments"]:
+            all_segments.append(Segment(s["start"] + offset, s["end"] + offset, s["text"]))
 
     return all_segments
 
@@ -232,19 +240,18 @@ def main():
         sys.exit(1)
 
     device = args.device or detect_device()
-    ct2_device = "cuda" if device == "cuda" else "cpu"
-    print(f"Device: {device} (whisper: {ct2_device}, diarization: {device})")
+    print(f"Device: {device} (whisper: Metal/MLX, diarization: {device})")
 
     t0 = time.perf_counter()
     if args.chunk_languages:
         candidates = args.languages
         label = f"candidates: {', '.join(candidates)}" if candidates else "any language"
         print(f"Transcribing with per-chunk language detection ({label})...")
-        segments = transcribe_audio_chunked(str(audio_path), args.model, device, candidates)
+        segments = transcribe_audio_chunked(str(audio_path), args.model, candidates)
     else:
         lang_label = args.language or "auto-detect"
         print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
-        segments = transcribe_audio(str(audio_path), args.model, device, args.language)
+        segments = transcribe_audio(str(audio_path), args.model, args.language)
     t1 = time.perf_counter()
     print(f"Transcription done in {t1 - t0:.1f}s")
 

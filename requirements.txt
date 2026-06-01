@@ -1,8 +1,8 @@
 # Environment variable loading
 python-dotenv
 
-# Core transcription
-faster-whisper
+# Core transcription (Apple Silicon — uses Metal via MLX)
+mlx-whisper
 
 # Speaker diarization (requires free HuggingFace account + token)
 pyannote.audio
