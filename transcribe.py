@@ -130,8 +130,8 @@ def transcribe_audio_chunked(
 
 
 def assign_speakers(segments, diarization) -> list[dict]:
-    # Newer pyannote wraps the Annotation in a DiarizeOutput namedtuple
-    annotation = getattr(diarization, "diarization", diarization)
+    # Newer pyannote wraps the Annotation in a DiarizeOutput dataclass
+    annotation = getattr(diarization, "speaker_diarization", diarization)
     results = []
     for seg in segments:
         midpoint = (seg.start + seg.end) / 2
