@@ -15,6 +15,7 @@ model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -209,6 +210,7 @@ def main():
     ct2_device = "cuda" if device == "cuda" else "cpu"
     print(f"Device: {device} (whisper: {ct2_device}, diarization: {device})")
 
+    t0 = time.perf_counter()
     if args.chunk_languages:
         candidates = args.languages
         label = f"candidates: {', '.join(candidates)}" if candidates else "any language"
@@ -218,6 +220,8 @@ def main():
         lang_label = args.language or "auto-detect"
         print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
         segments = transcribe_audio(str(audio_path), args.model, device, args.language)
+    t1 = time.perf_counter()
+    print(f"Transcription done in {t1 - t0:.1f}s")
 
     print("Running speaker diarization...")
     diarization = diarize(str(audio_path), args.hf_token, device)
