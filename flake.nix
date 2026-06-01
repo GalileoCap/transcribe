@@ -18,6 +18,10 @@
           ];
 
           shellHook = ''
+            # torchcodec looks for ffmpeg shared libs at Homebrew paths by default;
+            # point it at the Nix-provided ffmpeg instead.
+            export DYLD_LIBRARY_PATH="${pkgs.ffmpeg}/lib:$DYLD_LIBRARY_PATH"
+
             if [ ! -d .venv ]; then
               echo "Creating virtual environment..."
               python -m venv .venv

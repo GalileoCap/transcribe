@@ -37,7 +37,7 @@ def diarize(audio_path: str, hf_token: str, device: str):
 
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
+        token=hf_token,
     )
     if device in ("mps", "cuda"):
         pipeline = pipeline.to(torch.device(device))
