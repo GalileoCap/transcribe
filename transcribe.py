@@ -56,6 +56,48 @@ def transcribe_audio(audio_path: str, model_size: str, device: str, language: st
     return segments
 
 
+def transcribe_audio_chunked(
+    audio_path: str,
+    model_size: str,
+    device: str,
+    candidates: list[str] | None,
+    chunk_duration: int = 60,
+):
+    from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
+
+    compute_type = "float16" if device in ("cuda", "mps") else "int8"
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+    audio = decode_audio(audio_path)
+    sample_rate = 16000  # faster-whisper always resamples to 16 kHz
+    chunk_samples = chunk_duration * sample_rate
+    n_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
+
+    all_segments = []
+    prev_lang = (candidates or ["en"])[0]
+
+    for i in range(n_chunks):
+        chunk = audio[i * chunk_samples : (i + 1) * chunk_samples]
+        offset = i * chunk_duration
+
+        lang, prob = model.detect_language(chunk)
+        if candidates and lang not in candidates:
+            lang = prev_lang  # keep previous language rather than jumping to an unexpected one
+        prev_lang = lang
+
+        print(f"  [{format_time(offset)}] Language: {lang} ({prob:.0%})")
+
+        segments, _ = model.transcribe(chunk, language=lang, beam_size=5)
+        for seg in segments:
+            all_segments.append(seg._replace(
+                start=seg.start + offset,
+                end=seg.end + offset,
+            ))
+
+    return all_segments
+
+
 def assign_speakers(segments, diarization) -> list[dict]:
     results = []
     for seg in segments:
@@ -112,11 +154,25 @@ def main():
         default=os.environ.get("HF_TOKEN"),
         help="HuggingFace token (default: $HF_TOKEN env var)",
     )
-    parser.add_argument(
+    lang_group = parser.add_mutually_exclusive_group()
+    lang_group.add_argument(
         "--language",
         choices=["en", "es"],
         default=None,
-        help="Audio language: en (English) or es (Spanish). Auto-detected if omitted.",
+        help="Force a single language for the whole recording.",
+    )
+    lang_group.add_argument(
+        "--chunk-languages",
+        action="store_true",
+        help="Detect language per chunk (for meetings that switch languages mid-way).",
+    )
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        metavar="LANG",
+        default=None,
+        help="Candidate languages for --chunk-languages, e.g. --languages en es. "
+             "Detects from all Whisper languages if omitted.",
     )
     parser.add_argument(
         "--device",
@@ -145,9 +201,15 @@ def main():
     device = args.device or detect_device()
     print(f"Device: {device}")
 
-    lang_label = args.language or "auto-detect"
-    print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
-    segments = transcribe_audio(str(audio_path), args.model, device, args.language)
+    if args.chunk_languages:
+        candidates = args.languages
+        label = f"candidates: {', '.join(candidates)}" if candidates else "any language"
+        print(f"Transcribing with per-chunk language detection ({label})...")
+        segments = transcribe_audio_chunked(str(audio_path), args.model, device, candidates)
+    else:
+        lang_label = args.language or "auto-detect"
+        print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
+        segments = transcribe_audio(str(audio_path), args.model, device, args.language)
 
     print("Running speaker diarization...")
     diarization = diarize(str(audio_path), args.hf_token, device)
