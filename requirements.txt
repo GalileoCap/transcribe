@@ -1,0 +1,9 @@
+# Core transcription
+faster-whisper
+
+# Speaker diarization (requires free HuggingFace account + token)
+pyannote.audio
+
+# PyTorch — pip version has MPS support on Apple Silicon
+torch
+torchaudio

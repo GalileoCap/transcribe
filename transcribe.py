@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Transcribe meeting recordings with speaker diarization.
+
+Usage:
+    python transcribe.py meeting.mp4
+    python transcribe.py meeting.mp3 --model medium
+    python transcribe.py meeting.m4a --output transcript.txt
+
+Requires HF_TOKEN env var (or --hf-token) for pyannote speaker diarization.
+Get a free token at https://huggingface.co/settings/tokens and accept the
+model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+
+def detect_device() -> str:
+    import torch
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def diarize(audio_path: str, hf_token: str, device: str):
+    import torch
+    from pyannote.audio import Pipeline
+
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token,
+    )
+    if device in ("mps", "cuda"):
+        pipeline = pipeline.to(torch.device(device))
+
+    return pipeline(audio_path)
+
+
+def transcribe_audio(audio_path: str, model_size: str, device: str, language: str | None):
+    from faster_whisper import WhisperModel
+
+    compute_type = "float16" if device in ("cuda", "mps") else "int8"
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    segments, info = model.transcribe(audio_path, beam_size=5, language=language)
+    segments = list(segments)
+
+    print(f"  Language: {info.language} (confidence {info.language_probability:.0%})")
+    return segments
+
+
+def assign_speakers(segments, diarization) -> list[dict]:
+    results = []
+    for seg in segments:
+        midpoint = (seg.start + seg.end) / 2
+        speaker = "UNKNOWN"
+        for turn, _, label in diarization.itertracks(yield_label=True):
+            if turn.start <= midpoint <= turn.end:
+                speaker = label
+                break
+        results.append({
+            "start": seg.start,
+            "end": seg.end,
+            "speaker": speaker,
+            "text": seg.text.strip(),
+        })
+    return results
+
+
+def format_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def format_transcript(results: list[dict]) -> str:
+    lines = []
+    current_speaker = None
+    for r in results:
+        if not r["text"]:
+            continue
+        if r["speaker"] != current_speaker:
+            current_speaker = r["speaker"]
+            lines.append(f"\n[{format_time(r['start'])}] {r['speaker']}:")
+        lines.append(f"  {r['text']}")
+    return "\n".join(lines).strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Transcribe meeting recordings with speaker diarization",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("audio_file", help="Audio or video file to transcribe")
+    parser.add_argument(
+        "--model",
+        default="large-v3",
+        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        help="Whisper model size (default: large-v3; use small/medium for speed)",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN"),
+        help="HuggingFace token (default: $HF_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--language",
+        choices=["en", "es"],
+        default=None,
+        help="Audio language: en (English) or es (Spanish). Auto-detected if omitted.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda", "mps"],
+        default=None,
+        help="Compute device (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output file (default: <input>.txt)",
+    )
+    args = parser.parse_args()
+
+    audio_path = Path(args.audio_file)
+    if not audio_path.exists():
+        print(f"Error: file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.hf_token:
+        print("Error: HuggingFace token required for speaker diarization.", file=sys.stderr)
+        print("  Set HF_TOKEN env var or pass --hf-token.", file=sys.stderr)
+        print("  Get a token at https://huggingface.co/settings/tokens", file=sys.stderr)
+        sys.exit(1)
+
+    device = args.device or detect_device()
+    print(f"Device: {device}")
+
+    lang_label = args.language or "auto-detect"
+    print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
+    segments = transcribe_audio(str(audio_path), args.model, device, args.language)
+
+    print("Running speaker diarization...")
+    diarization = diarize(str(audio_path), args.hf_token, device)
+
+    print("Merging speakers and transcript...")
+    results = assign_speakers(segments, diarization)
+
+    transcript = format_transcript(results)
+
+    output_path = Path(args.output) if args.output else audio_path.with_suffix(".txt")
+    output_path.write_text(transcript, encoding="utf-8")
+    print(f"\nSaved: {output_path}")
+
+    preview = transcript.split("\n")[:15]
+    print("\n--- Preview ---")
+    print("\n".join(preview))
+    if len(transcript.split("\n")) > 15:
+        print("...")
+
+
+if __name__ == "__main__":
+    main()
