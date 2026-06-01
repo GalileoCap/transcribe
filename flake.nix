@@ -24,9 +24,11 @@
             fi
             source .venv/bin/activate
 
-            if ! python -c "import faster_whisper" 2>/dev/null; then
+            req_hash=$(sha256sum requirements.txt | cut -d' ' -f1)
+            stamp=.venv/.requirements-hash
+            if [ ! -f "$stamp" ] || [ "$(cat $stamp)" != "$req_hash" ]; then
               echo "Installing Python dependencies (this may take a few minutes)..."
-              pip install -q -r requirements.txt
+              pip install -q -r requirements.txt && echo "$req_hash" > "$stamp"
             fi
 
             echo ""
