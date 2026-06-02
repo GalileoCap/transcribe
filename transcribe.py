@@ -3,9 +3,14 @@
 Transcribe meeting recordings with speaker diarization.
 
 Usage:
-    python transcribe.py meeting.mp4
-    python transcribe.py meeting.mp3 --model medium
-    python transcribe.py meeting.m4a --output transcript.txt
+    python transcribe.py meeting.mp4  ./output/
+    python transcribe.py meeting.mp3  ./output/  --model medium
+    python transcribe.py meeting.m4a  ./output/  --chunk-languages --languages en es
+
+Artifacts written to output_dir/
+    audio.wav                — extracted 16 kHz mono audio
+    transcript_raw.txt       — timestamped Whisper segments, no speaker labels
+    transcript_diarized.txt  — full transcript with speaker labels
 
 Requires HF_TOKEN env var (or --hf-token) for pyannote speaker diarization.
 Get a free token at https://huggingface.co/settings/tokens and accept the
@@ -13,11 +18,12 @@ model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
 """
 
 import argparse
+import contextlib
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
-
 from typing import NamedTuple
 
 from dotenv import load_dotenv
@@ -40,6 +46,8 @@ MLX_MODELS = {
 }
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
 def detect_device() -> str:
     import torch
     if torch.backends.mps.is_available():
@@ -47,9 +55,44 @@ def detect_device() -> str:
     return "cpu"
 
 
+def format_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+@contextlib.contextmanager
+def timed_step(label: str):
+    """Print step start; on exit print elapsed time and optional artifact path."""
+    print(f"\n▶ {label}...")
+    t0 = time.perf_counter()
+    ctx: dict = {}
+    yield ctx
+    elapsed = time.perf_counter() - t0
+    artifact = f"  →  {ctx['artifact']}" if ctx.get("artifact") else ""
+    print(f"✓ {label}  {elapsed:.1f}s{artifact}")
+
+
+# ── pipeline steps ────────────────────────────────────────────────────────────
+
+def extract_audio(input_path: Path, output_dir: Path) -> Path:
+    """Decode any audio/video input to a canonical 16 kHz mono WAV artifact."""
+    out = output_dir / "audio.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-ac", "1", "-ar", "16000",
+            "-loglevel", "error",
+            str(out),
+        ],
+        check=True,
+    )
+    return out
+
+
 def load_audio_tensor(audio_path: str, sample_rate: int = 16000):
-    """Decode audio via the ffmpeg binary to avoid torchcodec shared-library issues."""
-    import subprocess
+    """Load audio as a torch tensor for pyannote via the ffmpeg binary."""
     import numpy as np
     import torch
 
@@ -67,21 +110,6 @@ def load_audio_tensor(audio_path: str, sample_rate: int = 16000):
         np.frombuffer(proc.stdout, dtype=np.float32).copy()
     ).unsqueeze(0)  # (1, samples)
     return waveform, sample_rate
-
-
-def diarize(audio_path: str, hf_token: str, device: str):
-    import torch
-    from pyannote.audio import Pipeline
-
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        token=hf_token,
-    )
-    if device == "mps":
-        pipeline = pipeline.to(torch.device("mps"))
-
-    waveform, sample_rate = load_audio_tensor(audio_path)
-    return pipeline({"waveform": waveform, "sample_rate": sample_rate})
 
 
 def transcribe_audio(audio_path: str, model_size: str, language: str | None) -> list[Segment]:
@@ -135,7 +163,22 @@ def transcribe_audio_chunked(
     return all_segments
 
 
-def assign_speakers(segments, diarization) -> list[dict]:
+def diarize(audio_path: str, hf_token: str, device: str):
+    import torch
+    from pyannote.audio import Pipeline
+
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        token=hf_token,
+    )
+    if device == "mps":
+        pipeline = pipeline.to(torch.device("mps"))
+
+    waveform, sample_rate = load_audio_tensor(audio_path)
+    return pipeline({"waveform": waveform, "sample_rate": sample_rate})
+
+
+def assign_speakers(segments: list[Segment], diarization) -> list[dict]:
     # Newer pyannote wraps the Annotation in a DiarizeOutput dataclass
     annotation = getattr(diarization, "speaker_diarization", diarization)
     results = []
@@ -155,12 +198,7 @@ def assign_speakers(segments, diarization) -> list[dict]:
     return results
 
 
-def format_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
+# ── formatting + artifact writers ─────────────────────────────────────────────
 
 def format_transcript(results: list[dict]) -> str:
     lines = []
@@ -175,6 +213,25 @@ def format_transcript(results: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
+def write_raw_transcript(segments: list[Segment], output_dir: Path) -> Path:
+    out = output_dir / "transcript_raw.txt"
+    lines = [
+        f"[{format_time(s.start)}] {s.text.strip()}"
+        for s in segments
+        if s.text.strip()
+    ]
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def write_diarized_transcript(results: list[dict], output_dir: Path) -> Path:
+    out = output_dir / "transcript_diarized.txt"
+    out.write_text(format_transcript(results), encoding="utf-8")
+    return out
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
         description="Transcribe meeting recordings with speaker diarization",
@@ -182,6 +239,10 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("audio_file", help="Audio or video file to transcribe")
+    parser.add_argument(
+        "output_dir",
+        help="Directory where all artifacts are written (created if absent)",
+    )
     parser.add_argument(
         "--model",
         default="large-v3",
@@ -219,16 +280,11 @@ def main():
         default=None,
         help="Compute device (default: auto-detect; mps on Apple Silicon, cpu otherwise)",
     )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output file (default: <input>.txt)",
-    )
     args = parser.parse_args()
 
-    audio_path = Path(args.audio_file)
-    if not audio_path.exists():
-        print(f"Error: file not found: {audio_path}", file=sys.stderr)
+    input_path = Path(args.audio_file)
+    if not input_path.exists():
+        print(f"Error: file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
     if not args.hf_token:
@@ -237,37 +293,50 @@ def main():
         print("  Get a token at https://huggingface.co/settings/tokens", file=sys.stderr)
         sys.exit(1)
 
-    device = args.device or detect_device()
-    print(f"Device: {device}")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.perf_counter()
+    device = args.device or detect_device()
+    print(f"Device:     {device}")
+    print(f"Output dir: {output_dir}/")
+
+    # ── 1. Extract audio ──────────────────────────────────────────────────────
+    with timed_step("Extracting audio") as ctx:
+        audio_path = extract_audio(input_path, output_dir)
+        ctx["artifact"] = audio_path
+
+    # ── 2. Transcribe ─────────────────────────────────────────────────────────
     if args.chunk_languages:
         candidates = args.languages
-        label = f"candidates: {', '.join(candidates)}" if candidates else "any language"
-        print(f"Transcribing with per-chunk language detection ({label})...")
-        segments = transcribe_audio_chunked(str(audio_path), args.model, candidates)
+        lang_desc = f"candidates: {', '.join(candidates)}" if candidates else "any language"
+        step_label = f"Transcribing ({args.model}, per-chunk detection, {lang_desc})"
     else:
-        lang_label = args.language or "auto-detect"
-        print(f"Transcribing with Whisper ({args.model}, language: {lang_label})...")
-        segments = transcribe_audio(str(audio_path), args.model, args.language)
-    t1 = time.perf_counter()
-    print(f"Transcription done in {t1 - t0:.1f}s")
+        lang_desc = args.language or "auto-detect"
+        step_label = f"Transcribing ({args.model}, language: {lang_desc})"
 
-    print("Running speaker diarization...")
-    diarization = diarize(str(audio_path), args.hf_token, device)
+    with timed_step(step_label) as ctx:
+        if args.chunk_languages:
+            segments = transcribe_audio_chunked(str(audio_path), args.model, args.languages)
+        else:
+            segments = transcribe_audio(str(audio_path), args.model, args.language)
+        raw_path = write_raw_transcript(segments, output_dir)
+        ctx["artifact"] = raw_path
 
-    print("Merging speakers and transcript...")
-    results = assign_speakers(segments, diarization)
+    # ── 3. Diarize ────────────────────────────────────────────────────────────
+    with timed_step("Running speaker diarization") as ctx:
+        diarization = diarize(str(audio_path), args.hf_token, device)
 
-    transcript = format_transcript(results)
+    # ── 4. Merge and write ────────────────────────────────────────────────────
+    with timed_step("Merging speakers and writing transcript") as ctx:
+        results = assign_speakers(segments, diarization)
+        diarized_path = write_diarized_transcript(results, output_dir)
+        ctx["artifact"] = diarized_path
 
-    output_path = Path(args.output) if args.output else audio_path.with_suffix(".txt")
-    output_path.write_text(transcript, encoding="utf-8")
-    print(f"\nSaved: {output_path}")
-
-    preview = transcript.split("\n")[:15]
+    # ── Preview ───────────────────────────────────────────────────────────────
+    transcript = diarized_path.read_text(encoding="utf-8")
+    preview_lines = transcript.split("\n")[:15]
     print("\n--- Preview ---")
-    print("\n".join(preview))
+    print("\n".join(preview_lines))
     if len(transcript.split("\n")) > 15:
         print("...")
 
