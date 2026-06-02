@@ -282,9 +282,9 @@ def main():
     )
     parser.add_argument(
         "--language",
-        choices=["en", "es"],
         default=None,
-        help="Force a single language for the whole recording (default: auto-detect).",
+        metavar="LANG",
+        help="Force a single language for the whole recording, e.g. en, es, pt (default: auto-detect).",
     )
     parser.add_argument(
         "--device",
