@@ -44,8 +44,6 @@ def detect_device() -> str:
     import torch
     if torch.backends.mps.is_available():
         return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
     return "cpu"
 
 
@@ -79,8 +77,8 @@ def diarize(audio_path: str, hf_token: str, device: str):
         "pyannote/speaker-diarization-3.1",
         token=hf_token,
     )
-    if device in ("mps", "cuda"):
-        pipeline = pipeline.to(torch.device(device))
+    if device == "mps":
+        pipeline = pipeline.to(torch.device("mps"))
 
     waveform, sample_rate = load_audio_tensor(audio_path)
     return pipeline({"waveform": waveform, "sample_rate": sample_rate})
@@ -217,9 +215,9 @@ def main():
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "cuda", "mps"],
+        choices=["cpu", "mps"],
         default=None,
-        help="Compute device (default: auto-detect)",
+        help="Compute device (default: auto-detect; mps on Apple Silicon, cpu otherwise)",
     )
     parser.add_argument(
         "--output",
@@ -240,7 +238,7 @@ def main():
         sys.exit(1)
 
     device = args.device or detect_device()
-    print(f"Device: {device} (whisper: Metal/MLX, diarization: {device})")
+    print(f"Device: {device}")
 
     t0 = time.perf_counter()
     if args.chunk_languages:
