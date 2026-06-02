@@ -5,12 +5,16 @@ Transcribe meeting recordings with speaker diarization.
 Usage:
     python transcribe.py meeting.mp4  ./output/
     python transcribe.py meeting.mp3  ./output/  --model medium
-    python transcribe.py meeting.m4a  ./output/  --chunk-languages --languages en es
+    python transcribe.py meeting.m4a  ./output/  --force   # re-run all steps
 
 Artifacts written to output_dir/
-    audio.wav                — extracted 16 kHz mono audio
-    transcript_raw.txt       — timestamped Whisper segments, no speaker labels
-    transcript_diarized.txt  — full transcript with speaker labels
+    audio.wav               — extracted 16 kHz mono audio
+    transcript_raw.txt      — timestamped Whisper segments, no speaker labels
+    diarization.rttm        — speaker turns in RTTM format
+    transcript_diarized.txt — full transcript with speaker labels
+
+Existing artifacts are reused automatically (skip completed steps).
+Pass --force to ignore cached artifacts and re-run everything.
 
 Requires HF_TOKEN env var (or --hf-token) for pyannote speaker diarization.
 Get a free token at https://huggingface.co/settings/tokens and accept the
@@ -20,6 +24,7 @@ model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
 import argparse
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import time
@@ -62,6 +67,18 @@ def format_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def format_time_precise(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def parse_time_precise(s: str) -> float:
+    h, m, sec = s.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(sec)
+
+
 @contextlib.contextmanager
 def timed_step(label: str):
     """Print step start; on exit print elapsed time and optional artifact path."""
@@ -72,6 +89,10 @@ def timed_step(label: str):
     elapsed = time.perf_counter() - t0
     artifact = f"  →  {ctx['artifact']}" if ctx.get("artifact") else ""
     print(f"✓ {label}  {elapsed:.1f}s{artifact}")
+
+
+def skip_step(label: str, artifact: Path) -> None:
+    print(f"\n– {label}  skipped  →  {artifact}")
 
 
 # ── pipeline steps ────────────────────────────────────────────────────────────
@@ -124,45 +145,6 @@ def transcribe_audio(audio_path: str, model_size: str, language: str | None) -> 
     return [Segment(s["start"], s["end"], s["text"]) for s in result["segments"]]
 
 
-def transcribe_audio_chunked(
-    audio_path: str,
-    model_size: str,
-    candidates: list[str] | None,
-    chunk_duration: int = 60,
-) -> list[Segment]:
-    import mlx_whisper
-    from mlx_whisper.audio import load_audio
-
-    repo = MLX_MODELS[model_size]
-    audio = load_audio(audio_path)  # float32 numpy array at 16 kHz
-    chunk_samples = chunk_duration * 16000
-    n_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
-
-    all_segments: list[Segment] = []
-    prev_lang = (candidates or ["en"])[0]
-
-    for i in range(n_chunks):
-        chunk = audio[i * chunk_samples : (i + 1) * chunk_samples]
-        offset = i * chunk_duration
-
-        result = mlx_whisper.transcribe(chunk, path_or_hf_repo=repo, language=None)
-        lang = result["language"]
-
-        if candidates and lang not in candidates:
-            # Detected language is outside the expected set — re-transcribe with the
-            # previous known language rather than accept a likely mis-detection.
-            result = mlx_whisper.transcribe(chunk, path_or_hf_repo=repo, language=prev_lang)
-            lang = prev_lang
-
-        prev_lang = lang
-        print(f"  [{format_time(offset)}] Language: {lang}")
-
-        for s in result["segments"]:
-            all_segments.append(Segment(s["start"] + offset, s["end"] + offset, s["text"]))
-
-    return all_segments
-
-
 def diarize(audio_path: str, hf_token: str, device: str):
     import torch
     from pyannote.audio import Pipeline
@@ -198,7 +180,68 @@ def assign_speakers(segments: list[Segment], diarization) -> list[dict]:
     return results
 
 
-# ── formatting + artifact writers ─────────────────────────────────────────────
+# ── artifact readers / writers ────────────────────────────────────────────────
+
+def write_raw_transcript(segments: list[Segment], output_dir: Path) -> Path:
+    out = output_dir / "transcript_raw.txt"
+    lines = [
+        f"[{format_time_precise(s.start)}-{format_time_precise(s.end)}] {s.text.strip()}"
+        for s in segments
+        if s.text.strip()
+    ]
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+_RAW_PATTERN = re.compile(
+    r'^\[(\d+:\d+:\d+\.\d+)-(\d+:\d+:\d+\.\d+)\] (.*)$'
+)
+
+def load_raw_transcript(path: Path) -> list[Segment]:
+    segments = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = _RAW_PATTERN.match(line)
+        if m:
+            segments.append(Segment(
+                parse_time_precise(m.group(1)),
+                parse_time_precise(m.group(2)),
+                m.group(3),
+            ))
+    return segments
+
+
+def write_rttm(diarization, path: Path) -> None:
+    annotation = getattr(diarization, "speaker_diarization", diarization)
+    with open(path, "w") as f:
+        for turn, _, label in annotation.itertracks(yield_label=True):
+            duration = turn.end - turn.start
+            f.write(
+                f"SPEAKER audio 1 {turn.start:.3f} {duration:.3f}"
+                f" <NA> <NA> {label} <NA> <NA>\n"
+            )
+
+
+def load_rttm(path: Path):
+    from pyannote.core import Annotation
+    from pyannote.core import Segment as PySegment
+
+    annotation = Annotation()
+    for line in path.read_text().splitlines():
+        parts = line.strip().split()
+        if not parts or parts[0] != "SPEAKER":
+            continue
+        start = float(parts[3])
+        duration = float(parts[4])
+        speaker = parts[7]
+        annotation[PySegment(start, start + duration)] = speaker
+    return annotation
+
+
+def write_diarized_transcript(results: list[dict], output_dir: Path) -> Path:
+    out = output_dir / "transcript_diarized.txt"
+    out.write_text(format_transcript(results), encoding="utf-8")
+    return out
+
 
 def format_transcript(results: list[dict]) -> str:
     lines = []
@@ -211,23 +254,6 @@ def format_transcript(results: list[dict]) -> str:
             lines.append(f"\n[{format_time(r['start'])}] {r['speaker']}:")
         lines.append(f"  {r['text']}")
     return "\n".join(lines).strip()
-
-
-def write_raw_transcript(segments: list[Segment], output_dir: Path) -> Path:
-    out = output_dir / "transcript_raw.txt"
-    lines = [
-        f"[{format_time(s.start)}] {s.text.strip()}"
-        for s in segments
-        if s.text.strip()
-    ]
-    out.write_text("\n".join(lines), encoding="utf-8")
-    return out
-
-
-def write_diarized_transcript(results: list[dict], output_dir: Path) -> Path:
-    out = output_dir / "transcript_diarized.txt"
-    out.write_text(format_transcript(results), encoding="utf-8")
-    return out
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -254,31 +280,22 @@ def main():
         default=os.environ.get("HF_TOKEN"),
         help="HuggingFace token (default: $HF_TOKEN env var)",
     )
-    lang_group = parser.add_mutually_exclusive_group()
-    lang_group.add_argument(
+    parser.add_argument(
         "--language",
         choices=["en", "es"],
         default=None,
-        help="Force a single language for the whole recording.",
-    )
-    lang_group.add_argument(
-        "--chunk-languages",
-        action="store_true",
-        help="Detect language per chunk (for meetings that switch languages mid-way).",
-    )
-    parser.add_argument(
-        "--languages",
-        nargs="+",
-        metavar="LANG",
-        default=None,
-        help="Candidate languages for --chunk-languages, e.g. --languages en es. "
-             "Detects from all Whisper languages if omitted.",
+        help="Force a single language for the whole recording (default: auto-detect).",
     )
     parser.add_argument(
         "--device",
         choices=["cpu", "mps"],
         default=None,
         help="Compute device (default: auto-detect; mps on Apple Silicon, cpu otherwise)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run all steps even if artifacts already exist in output_dir.",
     )
     args = parser.parse_args()
 
@@ -301,30 +318,37 @@ def main():
     print(f"Output dir: {output_dir}/")
 
     # ── 1. Extract audio ──────────────────────────────────────────────────────
-    with timed_step("Extracting audio") as ctx:
-        audio_path = extract_audio(input_path, output_dir)
-        ctx["artifact"] = audio_path
+    audio_wav = output_dir / "audio.wav"
+    if not args.force and audio_wav.exists():
+        skip_step("Extracting audio", audio_wav)
+        audio_path = audio_wav
+    else:
+        with timed_step("Extracting audio") as ctx:
+            audio_path = extract_audio(input_path, output_dir)
+            ctx["artifact"] = audio_path
 
     # ── 2. Transcribe ─────────────────────────────────────────────────────────
-    if args.chunk_languages:
-        candidates = args.languages
-        lang_desc = f"candidates: {', '.join(candidates)}" if candidates else "any language"
-        step_label = f"Transcribing ({args.model}, per-chunk detection, {lang_desc})"
+    raw_txt = output_dir / "transcript_raw.txt"
+    if not args.force and raw_txt.exists():
+        skip_step("Transcribing", raw_txt)
+        segments = load_raw_transcript(raw_txt)
     else:
-        lang_desc = args.language or "auto-detect"
-        step_label = f"Transcribing ({args.model}, language: {lang_desc})"
-
-    with timed_step(step_label) as ctx:
-        if args.chunk_languages:
-            segments = transcribe_audio_chunked(str(audio_path), args.model, args.languages)
-        else:
+        lang_label = args.language or "auto-detect"
+        with timed_step(f"Transcribing ({args.model}, language: {lang_label})") as ctx:
             segments = transcribe_audio(str(audio_path), args.model, args.language)
-        raw_path = write_raw_transcript(segments, output_dir)
-        ctx["artifact"] = raw_path
+            raw_path = write_raw_transcript(segments, output_dir)
+            ctx["artifact"] = raw_path
 
     # ── 3. Diarize ────────────────────────────────────────────────────────────
-    with timed_step("Running speaker diarization") as ctx:
-        diarization = diarize(str(audio_path), args.hf_token, device)
+    rttm_path = output_dir / "diarization.rttm"
+    if not args.force and rttm_path.exists():
+        skip_step("Speaker diarization", rttm_path)
+        diarization = load_rttm(rttm_path)
+    else:
+        with timed_step("Running speaker diarization") as ctx:
+            diarization = diarize(str(audio_path), args.hf_token, device)
+            write_rttm(diarization, rttm_path)
+            ctx["artifact"] = rttm_path
 
     # ── 4. Merge and write ────────────────────────────────────────────────────
     with timed_step("Merging speakers and writing transcript") as ctx:
